@@ -1,0 +1,13 @@
+{
+  "name": "superhooks",
+  "version": "0.1.0",
+  "description": "Write a Claude Code hook once; install it into every coding agent.",
+  "type": "module",
+  "bin": { "superhooks": "superhooks.mjs" },
+  "files": ["superhooks.mjs", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "keywords": ["hooks", "claude-code", "codex", "gemini-cli", "coding-agents", "agents"],
+  "repository": "github:dvrshil/superhooks",
+  "license": "MIT"
+}
