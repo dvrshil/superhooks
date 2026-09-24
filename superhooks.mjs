@@ -21,7 +21,10 @@ import { fileURLToPath } from "node:url";
 
 const VERSION = "0.1.0";
 const HOME = os.homedir();
-const STATE_DIR = process.env.SUPERHOOKS_HOME || path.join(HOME, ".superhooks");
+// The installed copy lives in the state dir, so it finds its state even under another $HOME.
+const OWN_DIR = path.dirname(fileURLToPath(import.meta.url));
+const STATE_DIR = process.env.SUPERHOOKS_HOME
+  || (fs.existsSync(path.join(OWN_DIR, "installed.json")) ? OWN_DIR : path.join(HOME, ".superhooks"));
 const INSTALLED_FILE = path.join(STATE_DIR, "installed.json");
 const STABLE_CLI = path.join(STATE_DIR, "superhooks.mjs");
 const LOG_FILE = path.join(STATE_DIR, "superhooks.log");
@@ -281,6 +284,8 @@ async function collectOptions(pkg, sets, interactive) {
  *   tools: Record<string, string[]>,       // Claude tool -> native tool names (first is canonical)
  *   nativeMatchers: boolean,               // does the agent filter by matcher itself?
  *   output: OutputStyle,
+ *   mcp?: "kiro" | "gemini",               // MCP tool naming, when not Claude's mcp__server__tool
+ *   timeUnit?: "ms",                       // hook timeout unit, when not seconds
  *   notes?: string,                        // shown after install
  * }} Agent
  */
@@ -306,6 +311,17 @@ export const AGENTS = {
     tools: { Bash: ["Bash"], Edit: ["apply_patch"], Write: ["apply_patch"], Task: ["spawn_agent"] },
     nativeMatchers: true, output: "json",
     notes: "Codex runs new hooks only after you trust them: open Codex and run /hooks.",
+  },
+  gemini: {
+    id: "gemini", name: "Gemini CLI", detect: ["~/.gemini"],
+    writer: "settings", file: "~/.gemini/settings.json", wrapperKey: "hooks",
+    events: { SessionStart: "SessionStart", UserPromptSubmit: "BeforeAgent", PreToolUse: "BeforeTool",
+      PostToolUse: "AfterTool", Stop: "AfterAgent", PreCompact: "PreCompress", SessionEnd: "SessionEnd",
+      Notification: "Notification" },
+    tools: { Bash: ["run_shell_command"], Read: ["read_file"], Write: ["write_file"], Edit: ["replace"],
+      Grep: ["grep_search", "search_file_content"], Glob: ["glob"], WebFetch: ["web_fetch"],
+      WebSearch: ["google_web_search"], TodoWrite: ["write_todos"] },
+    nativeMatchers: true, output: "json", mcp: "gemini", timeUnit: "ms",
   },
   factory: {
     id: "factory", name: "Factory Droid", detect: ["~/.factory"],
@@ -341,7 +357,7 @@ export const AGENTS = {
     tools: { Bash: ["execute_bash", "shell", "execute_cmd"], Read: ["read_file", "read_files", "fs_read", "read"],
       Write: ["fs_write", "write"], Edit: ["str_replace"], Grep: ["grep_search", "grep"],
       Glob: ["file_search", "glob"], WebFetch: ["web_fetch"], WebSearch: ["web_search"] },
-    nativeMatchers: true, output: "plain",
+    nativeMatchers: true, output: "plain", mcp: "kiro",
   },
   amp: {
     id: "amp", name: "Amp", detect: ["~/.config/amp"],
@@ -361,9 +377,20 @@ const CONTEXT_EVENTS = new Set(["SessionStart", "UserPromptSubmit", "PostToolUse
 /** @param {Agent} agent */
 export const isInstalled = (agent) => agent.detect.some((p) => fs.existsSync(expandHome(p)));
 
-/** Kiro spells MCP tools `@server/tool`; everyone else uses Claude's `mcp__server__tool`. */
+/** MCP tool names: Claude `mcp__server__tool`, Kiro `@server/tool`, Gemini `mcp_server_tool`. */
+function mcpToNative(/** @type {Agent} */ agent, /** @type {string} */ claudeName) {
+  const [server, ...tool] = claudeName.slice(5).split("__");
+  if (agent.mcp === "kiro") return `@${server}/${tool.join("__")}`;
+  if (agent.mcp === "gemini") return `mcp_${server}_${tool.join("__")}`;
+  return claudeName;
+}
+
 function nativeToolToClaude(/** @type {Agent} */ agent, /** @type {string} */ native) {
-  if (agent.id === "kiro" && native.startsWith("@")) return [native.slice(1).replace("/", "__").replace(/^/, "mcp__")];
+  if (agent.mcp === "kiro" && native.startsWith("@")) return [`mcp__${native.slice(1).replace("/", "__")}`];
+  // Gemini: mcp_<server>_<tool>. Server names may contain "_", so this split is best-effort.
+  if (agent.mcp === "gemini" && native.startsWith("mcp_") && !native.startsWith("mcp__")) {
+    return [`mcp__${native.slice(4).replace("_", "__")}`];
+  }
   const names = Object.entries(agent.tools).filter(([, natives]) => natives.includes(native)).map(([claude]) => claude);
   return names.length ? names : [native]; // unmapped names (e.g. identical MCP names) pass through
 }
@@ -394,14 +421,14 @@ export function claudeMatcherMatches(matcher, candidates) {
  * @returns {{ matcher?: string, skip?: string }}
  */
 export function translateMatcher(agent, event, matcher) {
-  if (!TOOL_EVENTS.has(event)) return agent.id === "claude" || agent.id === "codex" || agent.id === "factory" ? { matcher } : {};
+  if (!TOOL_EVENTS.has(event)) return ["claude", "codex", "factory"].includes(agent.id) ? { matcher } : {};
   if (!matcher || matcher === "*" || !/^[A-Za-z0-9_|, -]+$/.test(matcher) || agent.id === "claude") {
     return agent.id === "claude" ? { matcher } : {};
   }
   const tokens = matcher.split(/[|,]/).map((token) => token.trim()).filter(Boolean);
   const natives = new Set();
   for (const token of tokens) {
-    if (token.startsWith("mcp__")) natives.add(agent.id === "kiro" ? `@${token.slice(5).replace("__", "/")}` : token);
+    if (token.startsWith("mcp__")) natives.add(mcpToNative(agent, token));
     else if (agent.tools[token]) agent.tools[token].forEach((name) => natives.add(name));
   }
   if (!natives.size) return { skip: `${agent.name} has no equivalent of tool matcher "${matcher}"` };
@@ -416,8 +443,9 @@ export function translateMatcher(agent, event, matcher) {
 export function toClaude(agent, event, native) {
   const payload = { ...native, hook_event_name: event };
   if (typeof native.tool_name === "string") payload.tool_name = nativeToolToClaude(agent, native.tool_name)[0];
-  if (event === "Stop" && payload.last_assistant_message === undefined && native.assistant_response !== undefined) {
-    payload.last_assistant_message = native.assistant_response; // Kiro's name for it
+  if (event === "Stop" && payload.last_assistant_message === undefined) {
+    const last = native.assistant_response ?? native.prompt_response; // Kiro's and Gemini's names
+    if (last !== undefined) payload.last_assistant_message = last;
   }
   if (payload.stop_hook_active === undefined && event === "Stop") payload.stop_hook_active = false;
   return payload;
@@ -440,9 +468,18 @@ export function fromClaude(agent, event, result) {
     json = { hookSpecificOutput: { hookEventName: event, additionalContext: text } };
   }
   if (agent.output === "plain") return toPlain(event, json, text, result);
+  if (agent.id === "gemini" && event === "PreToolUse" && json?.hookSpecificOutput) json = toGeminiToolDecision(json);
   if (json?.hookSpecificOutput) json.hookSpecificOutput.hookEventName = agent.events[event] || event;
   const exitCode = result.exitCode === 0 || result.exitCode === 2 ? result.exitCode : 0; // other failures never block
   return { stdout: json ? JSON.stringify(json) : "", stderr: result.stderr, exitCode };
+}
+
+/** Gemini's BeforeTool uses top-level decision/reason and hookSpecificOutput.tool_input. @param {any} json */
+function toGeminiToolDecision(json) {
+  const { permissionDecision, permissionDecisionReason, updatedInput, ...rest } = json.hookSpecificOutput;
+  const out = { ...json, hookSpecificOutput: { ...rest, ...(updatedInput ? { tool_input: updatedInput } : {}) } };
+  if (permissionDecision === "deny") Object.assign(out, { decision: "deny", reason: permissionDecisionReason || json.reason });
+  return out;
 }
 
 /** @param {string} event @param {any} json @param {string} text @param {HookResult} result @returns {HookResult} */
@@ -482,7 +519,8 @@ export function planForAgent(agent, pkg) {
     if (hook.type !== "command") { skipped.push(`${event}: "${hook.type}" hooks are Claude-only`); continue; }
     const translated = translateMatcher(agent, event, matcher);
     if (translated.skip) { skipped.push(`${event}: ${translated.skip}`); continue; }
-    const timeout = (/** @type {ClaudeCommandHook} */ (hook).timeout || DEFAULT_TIMEOUT_SECONDS) + TIMEOUT_HEADROOM_SECONDS;
+    const seconds = (/** @type {ClaudeCommandHook} */ (hook).timeout || DEFAULT_TIMEOUT_SECONDS) + TIMEOUT_HEADROOM_SECONDS;
+    const timeout = agent.timeUnit === "ms" ? seconds * 1000 : seconds;
     entries.push({ event, native, matcher: translated.matcher, command: shimCommand(agent.id, pkg.id, event, index), timeout, index });
   }
   return { entries, skipped };

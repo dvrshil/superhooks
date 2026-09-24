@@ -56,6 +56,7 @@ test("Claude matcher semantics: exact lists and unanchored regex", () => {
 test("matchers translate to native tool names, or skip when nothing maps", () => {
   assert.deepEqual(translateMatcher(AGENTS.factory, "PreToolUse", "Bash|Write"), { matcher: "Execute|Create|ApplyPatch" });
   assert.deepEqual(translateMatcher(AGENTS.kiro, "PreToolUse", "mcp__db__query"), { matcher: "@db/query" });
+  assert.deepEqual(translateMatcher(AGENTS.gemini, "PreToolUse", "Bash|mcp__db__query"), { matcher: "run_shell_command|mcp_db_query" });
   assert.ok(translateMatcher(AGENTS.codex, "PreToolUse", "Read").skip);
   assert.deepEqual(translateMatcher(AGENTS.copilot, "PreToolUse", "Bash"), {}); // no native matchers: the shim filters
   assert.deepEqual(translateMatcher(AGENTS.devin, "PreToolUse", "Edit.*"), {}); // regex: the shim filters
@@ -87,6 +88,13 @@ test("output translation: JSON agents, plain-text Kiro, and fail-open exit codes
   assert.deepEqual(fromClaude(AGENTS.kiro, "PreToolUse", deny), { stdout: "", stderr: "nope", exitCode: 2 });
   assert.equal(fromClaude(AGENTS.kiro, "PreToolUse", { stdout: "", stderr: "boom", exitCode: 1 }).exitCode, 0);
   assert.equal(fromClaude(AGENTS.codex, "PreToolUse", { stdout: "", stderr: "boom", exitCode: 1 }).exitCode, 0);
+  const gemini = JSON.parse(fromClaude(AGENTS.gemini, "PreToolUse", deny).stdout);
+  assert.equal(gemini.decision, "deny");
+  assert.equal(gemini.reason, "nope");
+  assert.equal(gemini.hookSpecificOutput.hookEventName, "BeforeTool");
+  assert.equal(JSON.parse(fromClaude(AGENTS.gemini, "UserPromptSubmit", context).stdout).hookSpecificOutput.hookEventName, "BeforeAgent");
+  assert.equal(toClaude(AGENTS.gemini, "Stop", { prompt_response: "done" }).last_assistant_message, "done");
+  assert.equal(toClaude(AGENTS.gemini, "PreToolUse", { tool_name: "mcp_db_query" }).tool_name, "mcp__db__query");
   const stop = fromClaude(AGENTS.kiro, "Stop", { stdout: '{"decision":"block","reason":"keep going"}', stderr: "", exitCode: 0 });
   assert.deepEqual(JSON.parse(stop.stdout), { decision: "block", reason: "keep going" });
 });
@@ -115,7 +123,7 @@ test("listCommands addresses each command by event and index", () => {
 test("end to end: add installs into every detected agent; the shim runs the Claude hook for each", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "sh-home-"));
   const env = { ...process.env, HOME: home, SUPERHOOKS_HOME: path.join(home, ".superhooks") };
-  for (const dir of [".claude", ".codex", ".factory", ".config/devin", ".copilot", ".kiro", ".config/amp"]) {
+  for (const dir of [".claude", ".codex", ".gemini", ".factory", ".config/devin", ".copilot", ".kiro", ".config/amp"]) {
     fs.mkdirSync(path.join(home, dir), { recursive: true });
   }
   const plugin = makePlugin(path.join(home, "echo-hint"));
@@ -123,6 +131,9 @@ test("end to end: add installs into every detected agent; the shim runs the Clau
   assert.equal(add.status, 0, add.stderr);
   assert.match(add.stdout, /Codex: UserPromptSubmit, PreToolUse/);
   assert.match(add.stdout, /skipped Notification/);
+  const gemini = JSON.parse(fs.readFileSync(path.join(home, ".gemini/settings.json"), "utf8"));
+  assert.equal(gemini.hooks.BeforeTool[0].matcher, "run_shell_command");
+  assert.equal(gemini.hooks.BeforeAgent[0].hooks[0].timeout, 65000); // Gemini counts milliseconds
 
   const run = (agent, event, payload) => {
     const result = spawnSync("node", [path.join(home, ".superhooks", "superhooks.mjs"), "run", agent, "local/echo-hint", event, "0"],
@@ -130,7 +141,7 @@ test("end to end: add installs into every detected agent; the shim runs the Clau
     return result;
   };
   // Every JSON agent gets Claude-shaped context, with options and plugin root provided.
-  for (const agent of ["claude", "codex", "factory", "devin", "copilot"]) {
+  for (const agent of ["claude", "codex", "gemini", "factory", "devin", "copilot"]) {
     const out = JSON.parse(run(agent, "UserPromptSubmit", { hook_event_name: "UserPromptSubmit", prompt: "yo" }).stdout);
     assert.equal(out.hookSpecificOutput.additionalContext, `hello|yo|${agent}|echo-hint`);
   }
