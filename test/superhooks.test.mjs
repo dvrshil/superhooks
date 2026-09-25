@@ -58,6 +58,7 @@ test("matchers translate to native tool names, or skip when nothing maps", () =>
   assert.deepEqual(translateMatcher(AGENTS.kiro, "PreToolUse", "mcp__db__query"), { matcher: "@db/query" });
   assert.deepEqual(translateMatcher(AGENTS.gemini, "PreToolUse", "Bash|mcp__db__query"), { matcher: "run_shell_command|mcp_db_query" });
   assert.ok(translateMatcher(AGENTS.codex, "PreToolUse", "Read").skip);
+  assert.deepEqual(translateMatcher(AGENTS.qwen, "PreToolUse", "Write|Edit"), { matcher: "Write|Edit" }); // Qwen reads Claude names
   assert.deepEqual(translateMatcher(AGENTS.copilot, "PreToolUse", "Bash"), {}); // no native matchers: the shim filters
   assert.deepEqual(translateMatcher(AGENTS.devin, "PreToolUse", "Edit.*"), {}); // regex: the shim filters
 });
@@ -73,6 +74,7 @@ test("planForAgent maps events, drops unsupported ones, and explains why", () =>
 
 test("stdin translation: native tool names and Kiro's stop field become Claude's", () => {
   assert.equal(toClaude(AGENTS.factory, "PreToolUse", { tool_name: "Execute" }).tool_name, "Bash");
+  assert.equal(toClaude(AGENTS.qwen, "PreToolUse", { tool_name: "run_shell_command" }).tool_name, "Bash");
   assert.equal(toClaude(AGENTS.kiro, "PreToolUse", { tool_name: "@db/query" }).tool_name, "mcp__db__query");
   const stop = toClaude(AGENTS.kiro, "Stop", { hook_event_name: "stop", assistant_response: "done" });
   assert.equal(stop.hook_event_name, "Stop");
@@ -123,7 +125,7 @@ test("listCommands addresses each command by event and index", () => {
 test("end to end: add installs into every detected agent; the shim runs the Claude hook for each", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "sh-home-"));
   const env = { ...process.env, HOME: home, SUPERHOOKS_HOME: path.join(home, ".superhooks") };
-  for (const dir of [".claude", ".codex", ".gemini", ".factory", ".config/devin", ".copilot", ".kiro", ".config/amp"]) {
+  for (const dir of [".claude", ".codex", ".gemini", ".qwen", ".factory", ".config/devin", ".copilot", ".kiro", ".config/amp"]) {
     fs.mkdirSync(path.join(home, dir), { recursive: true });
   }
   const plugin = makePlugin(path.join(home, "echo-hint"));
@@ -141,7 +143,7 @@ test("end to end: add installs into every detected agent; the shim runs the Clau
     return result;
   };
   // Every JSON agent gets Claude-shaped context, with options and plugin root provided.
-  for (const agent of ["claude", "codex", "gemini", "factory", "devin", "copilot"]) {
+  for (const agent of ["claude", "codex", "gemini", "qwen", "factory", "devin", "copilot"]) {
     const out = JSON.parse(run(agent, "UserPromptSubmit", { hook_event_name: "UserPromptSubmit", prompt: "yo" }).stdout);
     assert.equal(out.hookSpecificOutput.additionalContext, `hello|yo|${agent}|echo-hint`);
   }

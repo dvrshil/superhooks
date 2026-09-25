@@ -283,6 +283,7 @@ async function collectOptions(pkg, sets, interactive) {
  *   events: Record<string, string>,        // Claude event -> native event
  *   tools: Record<string, string[]>,       // Claude tool -> native tool names (first is canonical)
  *   nativeMatchers: boolean,               // does the agent filter by matcher itself?
+ *   claudeMatchers?: boolean,              // does it accept Claude's matcher syntax and tool names as-is?
  *   output: OutputStyle,
  *   mcp?: "kiro" | "gemini",               // MCP tool naming, when not Claude's mcp__server__tool
  *   timeUnit?: "ms",                       // hook timeout unit, when not seconds
@@ -322,6 +323,15 @@ export const AGENTS = {
       Grep: ["grep_search", "search_file_content"], Glob: ["glob"], WebFetch: ["web_fetch"],
       WebSearch: ["google_web_search"], TodoWrite: ["write_todos"] },
     nativeMatchers: true, output: "json", mcp: "gemini", timeUnit: "ms",
+  },
+  qwen: {
+    id: "qwen", name: "Qwen Code", detect: ["~/.qwen"],
+    writer: "settings", file: "~/.qwen/settings.json", wrapperKey: "hooks",
+    events: same([...PORTABLE_EVENTS, "SubagentStop", "PreCompact", "SessionEnd", "Notification"]),
+    // Qwen matchers accept Claude's tool names directly; these map its runtime ids back for the shim.
+    tools: { Bash: ["run_shell_command"], Read: ["read_file"], Write: ["write_file"], Edit: ["edit"],
+      Glob: ["glob"], Grep: ["grep_search"], WebFetch: ["web_fetch"], WebSearch: ["web_search"], TodoWrite: ["todo_write"] },
+    nativeMatchers: true, claudeMatchers: true, output: "json",
   },
   factory: {
     id: "factory", name: "Factory Droid", detect: ["~/.factory"],
@@ -421,10 +431,9 @@ export function claudeMatcherMatches(matcher, candidates) {
  * @returns {{ matcher?: string, skip?: string }}
  */
 export function translateMatcher(agent, event, matcher) {
-  if (!TOOL_EVENTS.has(event)) return ["claude", "codex", "factory"].includes(agent.id) ? { matcher } : {};
-  if (!matcher || matcher === "*" || !/^[A-Za-z0-9_|, -]+$/.test(matcher) || agent.id === "claude") {
-    return agent.id === "claude" ? { matcher } : {};
-  }
+  if (!TOOL_EVENTS.has(event)) return ["claude", "codex", "factory", "qwen"].includes(agent.id) ? { matcher } : {};
+  if (agent.id === "claude" || agent.claudeMatchers) return { matcher };
+  if (!matcher || matcher === "*" || !/^[A-Za-z0-9_|, -]+$/.test(matcher)) return {};
   const tokens = matcher.split(/[|,]/).map((token) => token.trim()).filter(Boolean);
   const natives = new Set();
   for (const token of tokens) {
